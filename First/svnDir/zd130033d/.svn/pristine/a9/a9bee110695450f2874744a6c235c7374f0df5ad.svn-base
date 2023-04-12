@@ -1,0 +1,288 @@
+# include <stdlib.h>
+# include <stdio.h>
+# include <math.h>
+# include <time.h>
+# include <omp.h>
+# include <mpi.h>
+
+int main(int argc, char *argv[]);
+double f(double x);
+
+const int MASTER_RANK = 0;
+const double ACCURACY = 0.01;
+
+#define NUM_COMMS 3
+#define NUM_GROUPS 4
+
+int main(int argc, char *argv[]) {
+	double a;
+	double b;
+	int i;
+	int n;
+	int idx;
+	double total_q_seq, total_t_seq, total_s_seq;
+	double total_q_par, total_t_par, total_s_par;
+	double totalResults[NUM_GROUPS];
+	double wtime_q, wtime_t, wtime_s, wtime;
+
+	double x;
+	double h;
+	int rank;
+	int rankInternal;
+	int sizeInternal;
+	int ranksNew[NUM_COMMS];
+	int size;
+
+	MPI_Comm mpiComm[NUM_COMMS];
+	MPI_Group mpiGroup[NUM_COMMS];
+	MPI_Group mpiGlobalGroup;
+
+	MPI_Init(&argc, &argv);
+	MPI_Comm_size(MPI_COMM_WORLD, &size);
+	if (NUM_GROUPS != size) {
+		MPI_Abort(MPI_COMM_WORLD, -1);
+	}
+
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	if (MASTER_RANK == rank) {
+		if (argc != 4) {
+			n = 10000000;
+			a = 0.0;
+			b = 10.0;
+		}
+		else {
+			n = atoi(argv[1]);
+			a = atoi(argv[2]);
+			b = atoi(argv[3]);
+		}
+
+		printf("\n");
+		printf("QUAD:\n");
+		printf("  Estimate the integral of f(x) from A to B.\n");
+		printf("  f(x) = 50 / ( pi * ( 2500 * x * x + 1 ) ).\n");
+		printf("\n");
+		printf("  A        = %f\n", a);
+		printf("  B        = %f\n", b);
+		printf("  N        = %d\n", n);
+
+
+		// Quadratic rule  
+		wtime_q = omp_get_wtime();
+
+		total_q_seq = 0.0;
+
+		for (i = 0; i < n; i++)
+		{
+			x = ((double)(n - i - 1) * a + (double)(i)* b) / (double)(n - 1);
+			total_q_seq = total_q_seq + f(x);
+		}
+
+		wtime_q = omp_get_wtime() - wtime_q;
+
+		total_q_seq = (b - a) * total_q_seq / (double)n;
+
+
+		// Trapezoidal rule  
+		h = (b - a) / n;
+
+		wtime_t = omp_get_wtime();
+
+		total_t_seq = 0.0;
+
+		for (i = 0; i < n; i++)
+		{
+			x = a + i * h;
+			if (i > 0 && i < n - 1)
+				total_t_seq = total_t_seq + f(x);
+			else
+				total_t_seq = total_t_seq + 0.5 * f(x);
+		}
+
+		total_t_seq = h * total_t_seq;
+
+		wtime_t = omp_get_wtime() - wtime_t;
+
+		// Simpson 1/3 rule  
+
+		h = (b - a) / n;
+
+		wtime_s = omp_get_wtime();
+
+		total_s_seq = 0.0;
+
+		for (i = 0; i < n; i++)
+		{
+			x = a + i * h;
+			if (i == 0 || i == n - 1)
+				total_s_seq = total_s_seq + f(x);
+			else if (i % 2 == 1)
+				total_s_seq = total_s_seq + 4 * f(x);
+			else
+				total_s_seq = total_s_seq + 2 * f(x);
+		}
+
+		total_s_seq = h / 3 * total_s_seq;
+
+		wtime_s = omp_get_wtime() - wtime_s;
+
+		printf("\n");
+		printf("  Estimate quadratic rule = %24.16f\n", total_q_seq);
+		printf("  Estimate trapezoidal rule = %24.16f\n", total_t_seq);
+		printf("  Estimate Simpson 1/3 rule = %24.16f\n", total_s_seq);
+		printf("  Time quadratic rule = %f\n", wtime_q);
+		printf("  Time trapezoidal rule = %f\n", wtime_t);
+		printf("  Time Simpson 1/3 rule = %f\n", wtime_s);
+		printf("\n");
+		printf("  Sequential time = %f\n", wtime_q + wtime_s + wtime_t);
+		printf("  Normal end of execution.\n");
+		printf("\n");
+
+
+		// Parallel part.
+		//
+		if (argc != 4) {
+			n = 10000000;
+			a = 0.0;
+			b = 10.0;
+		}
+		else {
+			n = atoi(argv[1]);
+			a = atoi(argv[2]);
+			b = atoi(argv[3]);
+		}
+	}
+
+	if (MASTER_RANK == rank) {
+		wtime = omp_get_wtime();
+	}
+	// Ima smisla napraviti novu grupu koja ce se sastojati samo od grupa sa rangom 0 u podgrupama.
+	//
+	MPI_Bcast(&n, 1, MPI_INT, MASTER_RANK, MPI_COMM_WORLD);
+	MPI_Bcast(&a, 1, MPI_DOUBLE, MASTER_RANK, MPI_COMM_WORLD);
+	MPI_Bcast(&b, 1, MPI_DOUBLE, MASTER_RANK, MPI_COMM_WORLD);
+
+	MPI_Comm_group(MPI_COMM_WORLD, &mpiGlobalGroup);
+
+	for (idx = 0; idx < NUM_COMMS; idx++) {
+		ranksNew[idx] = idx + 1;
+		MPI_Group_incl(mpiGlobalGroup, 1, &ranksNew[idx], &mpiGroup[idx]);
+		MPI_Comm_create(MPI_COMM_WORLD, mpiGroup[idx], &mpiComm[idx]);
+	}
+
+	if (MASTER_RANK == rank) {
+		MPI_Gather(&total_q_par, 1, MPI_DOUBLE, totalResults, 1, MPI_DOUBLE, MASTER_RANK, MPI_COMM_WORLD);
+		wtime = omp_get_wtime() - wtime;
+
+		printf("  Time parallel execution = %f\n", wtime);
+
+		printf(" Quadratic %lf\n", totalResults[1]);
+		printf(" Traphezoid %lf\n", totalResults[2]);
+		printf(" Simpson %lf\n", totalResults[3]);
+
+		if ((fabs((total_q_seq - totalResults[1])) < ACCURACY) &&
+			(fabs((total_t_seq - totalResults[2])) < ACCURACY) &&
+			(fabs((total_s_seq - totalResults[3])) < ACCURACY)) {
+			printf("total_q_seq %f  par ; %f \n", total_q_seq, totalResults[1]);
+			printf("Test PASSED\n");
+		}
+		else {
+			printf("Test FAILED\n");
+		}
+
+
+	}
+	else if (rank == 1) {
+		// Quadratic rule  
+		MPI_Bcast(&n, 1, MPI_INT, MASTER_RANK, mpiComm[0]);
+		MPI_Bcast(&a, 1, MPI_DOUBLE, MASTER_RANK, mpiComm[0]);
+		MPI_Bcast(&b, 1, MPI_DOUBLE, MASTER_RANK, mpiComm[0]);
+
+		MPI_Comm_rank(mpiComm[0], &rankInternal);
+		MPI_Comm_size(mpiComm[0], &sizeInternal);
+		total_q_par = 0.0;
+
+		for (i = rankInternal * (n / sizeInternal); i < (rankInternal + 1) * (n / sizeInternal); i++)
+		{
+			x = ((double)(n - i - 1) * a + (double)(i)* b) / (double)(n - 1);
+			total_q_par = total_q_par + f(x);
+		}
+
+		total_q_par = (b - a) * total_q_par / (double)n;
+		MPI_Gather(&total_q_par, 1, MPI_DOUBLE, totalResults, 1, MPI_DOUBLE, MASTER_RANK, MPI_COMM_WORLD);
+	}
+	else if (rank == 2) {
+		// Trapezodial rule.
+
+		MPI_Bcast(&n, 1, MPI_INT, MASTER_RANK, mpiComm[1]);
+		MPI_Bcast(&a, 1, MPI_DOUBLE, MASTER_RANK, mpiComm[1]);
+		MPI_Bcast(&b, 1, MPI_DOUBLE, MASTER_RANK, mpiComm[1]);
+
+		MPI_Comm_rank(mpiComm[1], &rankInternal);
+		MPI_Comm_size(mpiComm[1], &sizeInternal);
+
+		h = (b - a) / n;
+
+
+		total_t_par = 0.0;
+
+		for (i = rankInternal * (n / sizeInternal); i < (rankInternal + 1) * (n / sizeInternal); i++)
+		{
+			x = a + i * h;
+			if (i > 0 && i < n - 1)
+				total_t_par = total_t_par + f(x);
+			else
+				total_t_par = total_t_par + 0.5 * f(x);
+		}
+
+		total_t_par = h * total_t_par;
+		MPI_Gather(&total_t_par, 1, MPI_DOUBLE, totalResults, 1, MPI_DOUBLE, MASTER_RANK, MPI_COMM_WORLD);
+	}
+	else if (rank == 3) {
+		// Simpson 1/3 rule  
+
+		MPI_Bcast(&n, 1, MPI_INT, MASTER_RANK, mpiComm[2]);
+		MPI_Bcast(&a, 1, MPI_DOUBLE, MASTER_RANK, mpiComm[2]);
+		MPI_Bcast(&b, 1, MPI_DOUBLE, MASTER_RANK, mpiComm[2]);
+
+		MPI_Comm_rank(mpiComm[2], &rankInternal);
+		MPI_Comm_size(mpiComm[2], &sizeInternal);
+
+		h = (b - a) / n;
+
+		total_s_par = 0.0;
+
+		for (i = rankInternal * (n / sizeInternal); i < (rankInternal + 1) * (n / sizeInternal); i++)
+		{
+			x = a + i * h;
+			if (i == 0 || i == n - 1)
+				total_s_par = total_s_par + f(x);
+			else if (i % 2 == 1)
+				total_s_par = total_s_par + 4 * f(x);
+			else
+				total_s_par = total_s_par + 2 * f(x);
+		}
+
+		total_s_par = h / 3 * total_s_par;
+		MPI_Gather(&total_s_par, 1, MPI_DOUBLE, totalResults, 1, MPI_DOUBLE, MASTER_RANK, MPI_COMM_WORLD);
+	}
+
+	for (idx = 0; idx < NUM_COMMS; idx++) {
+		if (rank == ranksNew[idx]) {
+			MPI_Comm_free(&mpiComm[idx]);
+		}
+		MPI_Group_free(&mpiGroup[idx]);
+	}
+
+	MPI_Finalize();
+	return 0;
+}
+
+double f(double x) {
+	double pi = 3.141592653589793;
+	double value;
+
+	value = 50.0 / (pi * (2500.0 * x * x + 1.0));
+
+	return value;
+}
+

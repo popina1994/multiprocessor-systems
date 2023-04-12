@@ -1,0 +1,599 @@
+# include <stdlib.h>
+# include <stdio.h>
+# include <math.h>
+# include <time.h>
+# include <mpi.h>
+# include <string.h>
+
+int main(int argc, char *argv[]);
+double cpu_time(void);
+
+#define NUM_PROCESSES 4
+const int MASTER_RANK = 0;
+
+int main(int argc, char *argv[])
+{
+	int M;
+	int N;
+
+	double ctime;
+	double ctime1;
+	double ctime2;
+	double diff;
+	double epsilon;
+	FILE *fp;
+	int i;
+	int iterations;
+	int iterations_print;
+	int j;
+	double mean;
+	char output_file_seq[80];
+	char output_file_par[80];
+	int success;
+
+	double **u;
+	double **wSeq;
+	double **wPar;
+
+	int rank;
+	int size;
+	int dest;
+	int src;
+	int tag;
+	double diffRecv;
+	MPI_Status status;
+
+	int over;
+	int curCnt;
+	int beginCol[NUM_PROCESSES];
+	int endCol[NUM_PROCESSES];
+	int curBeginCol;
+	int curEndCol;
+	int col;
+	int row;
+	double *tmpMemory;
+
+	MPI_Datatype columnType;
+
+
+	MPI_Init(&argc, &argv);
+	MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+
+	if (NUM_PROCESSES != size)
+	{
+		MPI_Abort(MPI_COMM_WORLD, -1);
+	}
+
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+	if (MASTER_RANK == rank)
+	{
+		if (argc != 5) {
+			printf("Wrong number of arguments!\n");
+			return 1;
+		}
+		else {
+			success = sscanf(argv[1], "%d", &M);
+			success += sscanf(argv[2], "%d", &N);
+			success += sscanf(argv[3], "%lf", &epsilon);
+			success += sscanf(argv[4], "%s", output_file_seq);
+
+			if (success != 4) {
+				printf("Wrong arguments!\n");
+				return 2;
+			}
+		}
+
+		printf("\n");
+		printf("HEATED_PLATE\n");
+		printf("  C version\n");
+		printf("  A program to solve for the steady state temperature distribution\n");
+		printf("  over a rectangular plate.\n");
+		printf("\n");
+		printf("  Spatial grid of %d by %d points.\n", M, N);
+		printf("\n");
+		printf("  The iteration will be repeated until the change is <= %f\n", epsilon);
+		diff = epsilon;
+		printf("\n");
+		printf("  The steady state solution will be written to %s.\n", output_file_seq);
+
+
+
+		u = (double **)malloc(M * sizeof(double*));
+		tmpMemory = malloc(M * N * sizeof(double));
+		for (i = 0; i < M; i++)
+			u[i] = (double *)&(tmpMemory[i * N]);
+
+		wSeq = (double **)malloc(M * sizeof(double*));
+		tmpMemory = malloc(M * N * sizeof(double));
+		for (i = 0; i < M; i++)
+			wSeq[i] = (double *)&(tmpMemory[i * N]);
+
+		wPar = (double **)malloc(M * sizeof(double*));
+		tmpMemory = malloc(M * N * sizeof(double));
+		for (i = 0; i < M; i++)
+			wPar[i] = (double *)&(tmpMemory[i * N]);
+
+		/*
+		Set the boundary values, which don't change.
+		*/
+		for (i = 1; i < M - 1; i++)
+		{
+			wSeq[i][0] = 100.0;
+		}
+		for (i = 1; i < M - 1; i++)
+		{
+			wSeq[i][N - 1] = 100.0;
+		}
+		for (j = 0; j < N; j++)
+		{
+			wSeq[M - 1][j] = 100.0;
+		}
+		for (j = 0; j < N; j++)
+		{
+			wSeq[0][j] = 0.0;
+		}
+		/*
+		Average the boundary values, to come up with a reasonable
+		initial value for the interior.
+		*/
+		mean = 0.0;
+		for (i = 1; i < M - 1; i++)
+		{
+			mean = mean + wSeq[i][0];
+		}
+		for (i = 1; i < M - 1; i++)
+		{
+			mean = mean + wSeq[i][N - 1];
+		}
+		for (j = 0; j < N; j++)
+		{
+			mean = mean + wSeq[M - 1][j];
+		}
+		for (j = 0; j < N; j++)
+		{
+			mean = mean + wSeq[0][j];
+		}
+		mean = mean / (double)(2 * M + 2 * N - 4);
+		/*
+		Initialize the interior solution to the mean value.
+		*/
+		for (i = 1; i < M - 1; i++)
+		{
+			for (j = 1; j < N - 1; j++)
+			{
+				wSeq[i][j] = mean;
+			}
+		}
+		/*
+		iterate until the  new solution W differs from the old solution U
+		by no more than EPSILON.
+		*/
+		iterations = 0;
+		iterations_print = 1;
+		printf("\n");
+		printf(" Iteration  Change\n");
+		printf("\n");
+		ctime1 = cpu_time();
+
+		while (epsilon <= diff)
+		{
+			/*
+			Save the old solution in U.
+			*/
+			for (i = 0; i < M; i++)
+			{
+				for (j = 0; j < N; j++)
+				{
+					u[i][j] = wSeq[i][j];
+				}
+			}
+			/*
+			Determine the new estimate of the solution at the interior points.
+			The new solution W is the average of north, south, east and west neighbors.
+			*/
+			diff = 0.0;
+			for (i = 1; i < M - 1; i++)
+			{
+				for (j = 1; j < N - 1; j++)
+				{
+					wSeq[i][j] = (u[i - 1][j] + u[i + 1][j] + u[i][j - 1] + u[i][j + 1]) / 4.0;
+
+					if (diff < fabs(wSeq[i][j] - u[i][j]))
+					{
+						diff = fabs(wSeq[i][j] - u[i][j]);
+					}
+				}
+			}
+			iterations++;
+			if (iterations == iterations_print)
+			{
+				printf("  %8d  %f\n", iterations, diff);
+				iterations_print = 2 * iterations_print;
+			}
+		}
+		ctime2 = cpu_time();
+		ctime = ctime2 - ctime1;
+
+		printf("\n");
+		printf("  %8d  %f\n", iterations, diff);
+		printf("\n");
+		printf("  Error tolerance achieved.\n");
+		printf("  CPU sequential time = %f\n", ctime);
+		/*
+		Write the solution to the output file.
+		*/
+		fp = fopen(output_file_seq, "w");
+
+		fprintf(fp, "%d\n", M);
+		fprintf(fp, "%d\n", N);
+
+		for (i = 0; i < M; i++)
+		{
+			for (j = 0; j < N; j++)
+			{
+				fprintf(fp, "%6.2f ", wSeq[i][j]);
+			}
+			fputc('\n', fp);
+		}
+		fclose(fp);
+
+		printf("\n");
+		printf("  Solution written to the output file %s\n", output_file_seq);
+		/*
+		All done!
+		*/
+		printf("\n");
+		printf("HEATED_PLATE:\n");
+		printf(" Sequential end of execution.\n");
+
+		strcpy(output_file_par, "par");
+		strcat(output_file_par, output_file_seq);
+#if 0
+		printf("***%d WWW***\n", rank);
+		for (row = 0; row < M; row++)
+		{
+			for (col = 0; col < N; col++)
+			{
+				printf("%.lf ", wSeq[row][col]);
+			}
+			printf("\n");
+		}
+#endif
+	}
+	// PARALLEL PART
+	MPI_Bcast(&M, 1, MPI_INT, MASTER_RANK, MPI_COMM_WORLD);
+	MPI_Bcast(&N, 1, MPI_INT, MASTER_RANK, MPI_COMM_WORLD);
+	MPI_Bcast(&epsilon, 1, MPI_DOUBLE, MASTER_RANK, MPI_COMM_WORLD);
+
+	if (MASTER_RANK == rank)
+	{
+
+		/*
+		Set the boundary values, which don't change.
+		*/
+		for (i = 1; i < M - 1; i++)
+		{
+			wPar[i][0] = 100.0;
+		}
+		for (i = 1; i < M - 1; i++)
+		{
+			wPar[i][N - 1] = 100.0;
+		}
+		for (j = 0; j < N; j++)
+		{
+			wPar[M - 1][j] = 100.0;
+		}
+		for (j = 0; j < N; j++)
+		{
+			wPar[0][j] = 0.0;
+		}
+		/*
+		Average the boundary values, to come up with a reasonable
+		initial value for the interior.
+		*/
+		mean = 0.0;
+		for (i = 1; i < M - 1; i++)
+		{
+			mean = mean + wPar[i][0];
+		}
+		for (i = 1; i < M - 1; i++)
+		{
+			mean = mean + wPar[i][N - 1];
+		}
+		for (j = 0; j < N; j++)
+		{
+			mean = mean + wPar[M - 1][j];
+		}
+		for (j = 0; j < N; j++)
+		{
+			mean = mean + wPar[0][j];
+		}
+		mean = mean / (double)(2 * M + 2 * N - 4);
+		/*
+		Initialize the interior solution to the mean value.
+		*/
+		for (i = 1; i < M - 1; i++)
+		{
+			for (j = 1; j < N - 1; j++)
+			{
+				wPar[i][j] = mean;
+			}
+		}
+		/*
+		iterate until the  new solution W differs from the old solution U
+		by no more than EPSILON.
+		*/
+	}
+	iterations = 0;
+	iterations_print = 1;
+	printf("\n");
+	printf(" Iteration  Change\n");
+	printf("\n");
+	if (MASTER_RANK == rank)
+	{
+		ctime1 = cpu_time();
+	}
+
+	MPI_Type_vector(M, 1, N, MPI_DOUBLE, &columnType);
+	MPI_Type_commit(&columnType);
+
+
+	if (MASTER_RANK == rank)
+	{
+		// Send data to all processes. 
+		// Do some shit.
+		int NBounded = N - 2;
+		over = NBounded - NUM_PROCESSES * (NBounded / NUM_PROCESSES);
+		curCnt = NBounded / NUM_PROCESSES;
+		if (over > 0) {
+			curCnt++;
+			over--;
+		}
+		dest = 0;
+		tag = 1;
+		beginCol[0] = 1;
+
+		// Ovo moze brze, ako ostane vremena. :) 
+		//
+		for (col = 1; col < N - 1; col++)
+		{
+			//printf("Col %d\n", col);
+			//printf("Cur cnt : %d\n", curCnt);
+			// N / (N / 4)
+			if (--curCnt == 0)
+			{
+				curCnt = NBounded / NUM_PROCESSES;
+				if (over > 0)
+				{
+					curCnt++;
+					over--;
+				}
+				//printf("Destinacija je %d\n", dest);
+				endCol[dest++] = col;
+				if (dest < NUM_PROCESSES)
+				{
+					beginCol[dest] = col + 1;
+				}
+			}
+		}
+	}
+
+	MPI_Scatter(&beginCol, 1, MPI_INT, &curBeginCol, 1, MPI_INT, MASTER_RANK, MPI_COMM_WORLD);
+	MPI_Scatter(&endCol, 1, MPI_INT, &curEndCol, 1, MPI_INT, MASTER_RANK, MPI_COMM_WORLD);
+	printf("Trenutna %d %d %d\n", rank, curBeginCol, curEndCol);
+
+	// Vidi da izbacis nepotrebno slanje. :) 
+	//
+	if (MASTER_RANK == rank)
+	{
+		for (dest = MASTER_RANK + 1; dest < NUM_PROCESSES; dest++)
+		{
+			for (col = beginCol[dest] - 1; col <= endCol[dest] + 1; col++)
+			{
+				MPI_Send(&wPar[0][col], 1, columnType, dest, 1, MPI_COMM_WORLD);
+			}
+		}
+	}
+	else {
+		u = (double **)malloc(M * sizeof(double*));
+		tmpMemory = (double*)malloc(M * N * sizeof(double));
+		for (i = 0; i < M; i++)
+			u[i] = (double *)&(tmpMemory[i * N]);
+		wPar = (double **)malloc(M * sizeof(double*));
+		tmpMemory = malloc(M * N * sizeof(double));
+		for (i = 0; i < M; i++)
+			wPar[i] = (double *)&(tmpMemory[i * N]);
+		for (col = curBeginCol - 1; col <= curEndCol + 1; col++)
+		{
+			MPI_Recv(&wPar[0][col], 1, columnType, MASTER_RANK, 1, MPI_COMM_WORLD, &status);
+			//printf("Primljena : %lf %d 1\n", wPar[2][col], rank);
+		}
+
+
+	}
+
+	diff = epsilon;
+
+	while (epsilon <= diff)
+	{
+		/*
+		Save the old solution in U.
+		*/
+		if (MASTER_RANK != rank)
+		{
+			MPI_Send(&wPar[0][curBeginCol], 1, columnType, rank - 1, 2, MPI_COMM_WORLD);
+			//printf("Poslata : %lf od %d kolona %d  tag 2\n", wPar[1][curBeginCol], rank, curBeginCol);
+		}
+
+		if ((NUM_PROCESSES - 1) != rank) {
+			MPI_Send(&wPar[0][curEndCol], 1, columnType, rank + 1, 3, MPI_COMM_WORLD);
+			//printf("Poslata : %lf %d 3\n", wPar[1][curEndCol], rank);
+		}
+		if (MASTER_RANK != rank)
+		{
+			MPI_Recv(&wPar[0][curBeginCol - 1], 1, columnType, rank - 1, 3, MPI_COMM_WORLD, &status);
+			//printf("Primljena : %lf %d 3\n", wPar[1][curBeginCol - 1], rank - 1);
+		}
+		if ((NUM_PROCESSES - 1) != rank)
+		{
+			MPI_Recv(&wPar[0][curEndCol + 1], 1, columnType, rank + 1, 2, MPI_COMM_WORLD, &status);
+			//printf("Primljena : %lf od %d kolona tag 2 %d\n", wPar[1][curEndCol + 1], rank + 1, curEndCol + 1);
+		}
+
+		for (row = 0; row < M; row++)
+		{
+			for (col = curBeginCol - 1; col <= curEndCol + 1; col++)
+			{
+				u[row][col] = wPar[row][col];
+			}
+		}
+
+#if 0
+		printf("***%d WWW***\n", rank);
+		for (row = 0; row < M; row++)
+		{
+			for (col = 0; col < N; col++)
+			{
+				printf("%.lf ", wPar[row][col]);
+			}
+			printf("\n");
+		}
+
+		printf("***%d UUU***\n", rank);
+		for (row = 0; row < M; row++)
+		{
+			for (col = 0; col < N; col++)
+			{
+				printf("%.lf ", u[row][col]);
+			}
+			printf("\n");
+		}
+#endif
+		/*
+		Determine the new estimate of	 the solution at the interior points.
+		The new solution W is the average of north, south, east and west neighbors.
+		*/
+		diff = 0.0;
+		for (i = 1; i < M - 1; i++)
+		{
+			for (j = curBeginCol; j <= curEndCol; j++)
+			{
+				wPar[i][j] = (u[i - 1][j] + u[i + 1][j] + u[i][j - 1] + u[i][j + 1]) / 4.0;
+
+				if (diff < fabs(wPar[i][j] - u[i][j]))
+				{
+					diff = fabs(wPar[i][j] - u[i][j]);
+					//printf("Razlika za vrstu %d kolonu %d %lf rank %d\n", i, j, diff, rank);
+
+				}
+			}
+		}
+		iterations++;
+		if (iterations == iterations_print)
+		{
+			//printf(" Iteration %8d  %f rank %d \n", iterations, diff, rank);
+			iterations_print = 2 * iterations_print;
+			//iterations_print++;
+		}
+		MPI_Allreduce(&diff, &diffRecv, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+		diff = diffRecv;
+	}
+	if (MASTER_RANK == rank) {
+		for (src = MASTER_RANK + 1; src < NUM_PROCESSES; src++)
+		{
+
+			for (col = beginCol[src]; col <= endCol[src]; col++)
+			{
+				MPI_Recv(&wPar[0][col], 1, columnType, src, 4, MPI_COMM_WORLD, &status);
+			}
+
+		}
+	}
+	else {
+		for (col = curBeginCol; col <= curEndCol; col++)
+		{
+			MPI_Send(&wPar[0][col], 1, columnType, MASTER_RANK, 4, MPI_COMM_WORLD);
+		}
+	}
+
+
+	if (MASTER_RANK == rank)
+	{
+#if 0
+		printf("***%d WWW***\n", rank);
+		for (row = 0; row < M; row++)
+		{
+			for (col = 0; col < N; col++)
+			{
+				printf("%.lf ", wPar[row][col]);
+			}
+			printf("\n");
+		}
+#endif
+		ctime2 = cpu_time();
+		ctime = ctime2 - ctime1;
+		printf("\n");
+		printf("  %8d  %f\n", iterations, diff);
+		printf("\n");
+		printf("  Error tolerance achieved.\n");
+		printf("  CPU parallel time = %f\n", ctime);
+		/*
+		Write the solution to the output file.
+		*/
+		fp = fopen(output_file_par, "w");
+
+		fprintf(fp, "%d\n", M);
+		fprintf(fp, "%d\n", N);
+
+		for (i = 0; i < M; i++)
+		{
+			for (j = 0; j < N; j++)
+			{
+				fprintf(fp, "%6.2f ", wPar[i][j]);
+			}
+			fputc('\n', fp);
+		}
+		fclose(fp);
+
+		printf("\n");
+		printf("  Solution written to the output file %s\n", output_file_par);
+		/*
+		All done!
+		*/
+		printf("\n");
+		printf("HEATED_PLATE:\n");
+		printf("Parallel   end of execution.\n");
+
+		int testPassed = 1;
+		for (int i = 0; i < M; i++)
+			for (int j = 0; j < N; j++) {
+				if (wSeq[i][j] != wPar[i][j]) {
+					testPassed = 0;
+					break;
+				}
+			}
+		if (testPassed) {
+			printf("Test PASSED\n");
+		}
+		else {
+			printf("Test FAILED");
+		}
+	}
+
+	MPI_Type_free(&columnType);
+	MPI_Finalize();
+
+	return 0;
+
+}
+
+double cpu_time(void)
+{
+	double value;
+
+	value = (double)clock() / (double)CLOCKS_PER_SEC;
+
+	return value;
+}

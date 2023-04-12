@@ -1,0 +1,3 @@
+mpirun -np 4 ./heated_plate 200 500 0.1 sol_200x500.txt
+mpirun -np 4 ./heated_plate 500 500 0.1 sol_500x500.txt
+mpirun -np 4 ./heated_plate 1000 1000  0.1 sol_1000x1000.txt

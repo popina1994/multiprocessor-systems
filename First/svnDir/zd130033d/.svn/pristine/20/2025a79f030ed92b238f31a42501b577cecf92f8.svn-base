@@ -1,0 +1,425 @@
+
+#include <cuda.h>
+#include <cuda_runtime_api.h>
+#include <device_launch_parameters.h>
+
+# include <stdlib.h>
+# include <stdio.h>
+# include <math.h>
+# include <time.h>
+# include <omp.h>
+#include <cstring>
+#include <bitset>
+
+#define NUM_OF_GPU_THREADS 1024
+
+const double ACCURACY = 0.01;
+
+__device__ __constant__ double aGpu;
+__device__ __constant__ double bGpu;
+__device__ __constant__ int nGpu;
+
+double a;
+double b;
+int n;
+
+double f(double x);
+
+__device__ double gpuF(double x) {
+	//return 1;
+	double pi = 3.141592653589793;
+	double value;
+
+	value = 50.0 / (pi * (2500.0 * x * x + 1.0));
+
+	return value;
+}
+
+__global__ void addKernelQuadratic(double *sum)
+{
+	__shared__ double sharedData[NUM_OF_GPU_THREADS];
+
+	unsigned int threadId;;
+	unsigned int retIdx;
+	unsigned int i;
+	double x;
+
+	threadId = threadIdx.x;
+	retIdx = blockIdx.x;
+	i = blockIdx.x * blockDim.x + threadId;
+
+	x = ((double)(nGpu - i - 1) * aGpu + (double)(i)* bGpu) /
+		(double)(nGpu - 1);
+	sharedData[threadId] = gpuF(x);
+	__syncthreads();
+	// do reduction in shared mem
+	for (unsigned int s = NUM_OF_GPU_THREADS / 2; s > 0; s >>= 1) {
+		if (threadId < s) {
+			sharedData[threadId] = sharedData[threadId] +
+				sharedData[threadId + s];
+		}
+		__syncthreads();
+	}
+
+	if (threadId == 0)
+	{
+		sum[retIdx] = sharedData[0];
+	}
+
+}
+
+double reduceCPUQuadratic(double *sum)
+{
+	int idx;
+	double result = 0.0;
+	double x;
+	for (idx = 0; idx < n / NUM_OF_GPU_THREADS; idx++)
+	{
+		result += sum[idx];
+	}
+
+	for (idx = (n / NUM_OF_GPU_THREADS) * NUM_OF_GPU_THREADS; idx < n; idx++)
+	{
+		x = ((double)(n - idx - 1) * a + (double)(idx)* b) /
+			(double)(n - 1);
+		result += f(x);
+	}
+
+	return  result;
+}
+
+#if 0
+__global__ void reduceKernelQuadratic(double *sum)
+{
+	__shared__ double sharedData[NUM_OF_GPU_THREADS];
+
+	unsigned int threadId = threadIdx.x;
+	sharedData[threadId] = sum[threadId];
+
+	__syncthreads();
+	// do reduction in shared mem
+	for (unsigned int s = NUM_OF_GPU_THREADS / 2; s > 0; s >>= 1) {
+		if (threadId < s) {
+			sharedData[threadId] = sharedData[threadId] +
+				sharedData[threadId + s];
+		}
+		__syncthreads();
+	}
+	// write result for this block to global mem
+	if (threadId == 0) sum[0] = sharedData[0];
+
+}
+#endif
+
+int main(int argc, char *argv[]);
+
+double f(double x) {
+	double pi = 3.141592653589793;
+	double value;
+
+	value = 50.0 / (pi * (2500.0 * x * x + 1.0));
+
+	return value;
+}
+
+
+
+
+int main(int argc, char *argv[])
+{
+
+
+	clock_t start_time = clock();
+
+	cudaError_t cudaStatus;
+	//double error;
+	int i;
+	double total_qSeq = 0, total_tSeq = 0, total_sSeq = 0;
+	double total_qPar = 0, total_tPar = 0, total_sPar = 0;
+	double wtime_qSeq = 0, wtime_tSeq = 0, wtime_sSeq = 0;
+	double wtime_qPar = 0, wtime_tPar = 0, wtime_sPar = 0;
+
+	//double sum[NUM_OF_GPU_THREADS];
+
+	double x;
+	double h;
+
+	double *sumGPU, *sumCPU;
+
+	if (argc != 4) {
+		n = 10000000;
+		a = 0.0;
+		b = 10.0;
+	}
+	else {
+		n = atoi(argv[1]);
+		a = atoi(argv[2]);
+		b = atoi(argv[3]);
+	}
+
+
+
+	printf("\n");
+	printf("QUAD:\n");
+	printf("  Estimate the integral of f(x) from A to B.\n");
+	printf("  f(x) = 50 / ( pi * ( 2500 * x * x + 1 ) ).\n");
+	printf("\n");
+	printf("  A        = %f\n", a);
+	printf("  B        = %f\n", b);
+	printf("  N        = %d\n", n);
+
+
+	// Quadratic rule  
+	wtime_qSeq = omp_get_wtime();
+
+	total_qSeq = 0.0;
+
+	for (i = 0; i < n; i++)
+	{
+		x = ((double)(n - i - 1) * a + (double)(i)* b) / (double)(n - 1);
+		total_qSeq = total_qSeq + f(x);
+	}
+
+	wtime_qSeq = omp_get_wtime() - wtime_qSeq;
+
+	total_qSeq = (b - a) * total_qSeq / (double)n;
+
+#if 0
+	// Trapezoidal rule  
+	h = (b - a) / n;
+
+	wtime_tSeq = omp_get_wtime();
+
+	total_tSeq = 0.0;
+
+	for (i = 0; i < n; i++)
+	{
+		x = a + i * h;
+		if (i > 0 && i < n - 1)
+			total_tSeq = total_tSeq + f(x);
+		else
+			total_tSeq = total_tSeq + 0.5 * f(x);
+	}
+
+	total_tSeq = h * total_tSeq;
+
+	wtime_tSeq = omp_get_wtime() - wtime_tSeq;
+
+	// Simpson 1/3 rule  
+
+	h = (b - a) / n;
+
+	wtime_sSeq = omp_get_wtime();
+
+	total_sSeq = 0.0;
+
+	for (i = 0; i < n; i++)
+	{
+		x = a + i * h;
+		if (i == 0 || i == n - 1)
+			total_sSeq = total_sSeq + f(x);
+		else if (i % 2 == 1)
+			total_sSeq = total_sSeq + 4 * f(x);
+		else
+			total_sSeq = total_sSeq + 2 * f(x);
+	}
+
+	total_sSeq = h / 3 * total_sSeq;
+
+	wtime_sSeq = omp_get_wtime() - wtime_sSeq;
+#endif
+	printf("Sequential \n");
+	printf("  Estimate quadratic rule = %24.16f\n", total_qSeq);
+	printf("  Estimate trapezoidal rule = %24.16f\n", total_tSeq);
+	printf("  Estimate Simpson 1/3 rule = %24.16f\n", total_sSeq);
+	printf("  Time quadratic rule = %f\n", wtime_qSeq);
+	printf("  Time trapezoidal rule = %f\n", wtime_tSeq);
+	printf("  Time Simpson 1/3 rule = %f\n", wtime_sSeq);
+	printf("\n");
+	printf("  Normal end of execution.\n");
+	printf("\n");
+
+
+
+
+
+	// AJSFDKSFDKSFDJSFDJDFJSDFJSFD
+
+
+	// Quadratic rule parallel.
+	//
+
+
+	cudaStatus = cudaMemcpyToSymbol(aGpu, &a, sizeof(double));
+	wtime_qPar = omp_get_wtime();
+	cudaStatus = cudaMemcpyToSymbol(bGpu, &b, sizeof(double));
+	cudaStatus = cudaMemcpyToSymbol(nGpu, &n, sizeof(int));
+
+	total_qPar = 0.0;
+
+	//x = ((double)(n - i - 1) * a + (double)(i)* b) / (double)(n - 1);
+
+	size_t allocSize = n / NUM_OF_GPU_THREADS * sizeof(double);
+
+	cudaStatus = cudaMalloc((void**)&sumGPU, allocSize);
+	sumCPU = (double*)malloc(allocSize);
+
+	addKernelQuadratic << < n / NUM_OF_GPU_THREADS, NUM_OF_GPU_THREADS >> >(sumGPU);
+
+	cudaStatus = cudaMemcpy(sumCPU, sumGPU, allocSize, cudaMemcpyDeviceToHost);
+
+	total_qPar = reduceCPUQuadratic(sumCPU);
+
+	total_qPar = (b - a) * total_qPar / (double)n;
+	wtime_qPar = omp_get_wtime() - wtime_qPar;
+#if 0
+	// Trapezoidal rule  
+	h = (b - a) / n;
+
+	wtime_tPar = omp_get_wtime();
+
+	total_tPar = 0.0;
+
+	for (i = 0; i < n; i++)
+	{
+		x = a + i * h;
+		if (i > 0 && i < n - 1)
+			total_tPar = total_tPar + f(x);
+		else
+			total_tPar = total_tPar + 0.5 * f(x);
+	}
+
+	total_tPar = h * total_tPar;
+
+	wtime_tPar = omp_get_wtime() - wtime_tPar;
+
+	// Simpson 1/3 rule  
+
+	h = (b - a) / n;
+
+	wtime_sPar = omp_get_wtime();
+
+	total_sPar = 0.0;
+
+	for (i = 0; i < n; i++)
+	{
+		x = a + i * h;
+		if (i == 0 || i == n - 1)
+			total_sPar = total_sPar + f(x);
+		else if (i % 2 == 1)
+			total_sPar = total_sPar + 4 * f(x);
+		else
+			total_sPar = total_sPar + 2 * f(x);
+	}
+
+	total_sPar = h / 3 * total_sPar;
+
+	wtime_sPar = omp_get_wtime() - wtime_sPar;
+#endif
+	printf("Parallel \n");
+	printf("  Estimate quadratic rule = %24.16f\n", total_qPar);
+	printf("  Estimate trapezoidal rule = %24.16f\n", total_tPar);
+	printf("  Estimate Simpson 1/3 rule = %24.16f\n", total_sPar);
+	printf("  Time quadratic rule = %f\n", wtime_qPar);
+	printf("  Time trapezoidal rule = %f\n", wtime_tPar);
+	printf("  Time Simpson 1/3 rule = %f\n", wtime_sPar);
+	printf("\n");
+	printf("  Normal end of execution.\n");
+	printf("\n");
+
+	if ((fabs(total_tPar - total_tSeq) < ACCURACY) &&
+		(fabs(total_qPar - total_qSeq) < ACCURACY) &&
+		(fabs(total_sPar - total_sSeq) < ACCURACY))
+	{
+		printf("Test passed\n");
+	}
+	else
+	{
+		printf("Test failed\n");
+	}
+
+	return 0;
+}
+
+#if 0
+// Helper function for using CUDA to add vectors in parallel.
+cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size)
+{
+	int *dev_a = 0;
+	int *dev_b = 0;
+	int *dev_c = 0;
+	cudaError_t cudaStatus;
+
+	// Choose which GPU to run on, change this on a multi-GPU system.
+	cudaStatus = cudaSetDevice(0);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
+		goto Error;
+	}
+
+	// Allocate GPU buffers for three vectors (two input, one output)    .
+	cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	// Copy input vectors from host memory to GPU buffers.
+	cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
+
+	// Launch a kernel on the GPU with one thread for each element.
+
+	//addKernel<<<size / NUM_OF_GPU_THREADS, NUM_OF_GPU_THREADS>>>(sum, dev_a, dev_b);
+
+	// Check for any errors launching the kernel
+	cudaStatus = cudaGetLastError();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+		goto Error;
+	}
+
+	// cudaDeviceSynchronize waits for the kernel to finish, and returns
+	// any errors encountered during the launch.
+	cudaStatus = cudaDeviceSynchronize();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
+		goto Error;
+	}
+
+	// Copy output vector from GPU buffer to host memory.
+	cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
+
+Error:
+	cudaFree(dev_c);
+	cudaFree(dev_a);
+	cudaFree(dev_b);
+
+	return cudaStatus;
+}
+#endif

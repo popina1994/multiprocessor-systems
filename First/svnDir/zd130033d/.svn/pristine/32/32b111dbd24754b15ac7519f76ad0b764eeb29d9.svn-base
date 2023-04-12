@@ -1,0 +1,463 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <strings.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <math.h>
+#include <mpi.h>
+
+#include "args.h"
+#include "model.h"
+
+
+
+#define TAG_SIGNAL 0x001
+#define TAG_RANDOM 0x002
+#define TAG_DATA   0x003
+#define TAG_NPR    0x004
+#define TAG_NPD    0x005
+#define TAG_JOB_FINISHED 0x006
+#define TAG_RANDOM_NULL 0x007
+#define TAG_DATA_NULL 0x008
+#define TAG_DRS 0x009
+#define TAG_RRS 0x00A
+
+
+void CompareAndSet(long long *first, long long *second, size_t memsize, int *isEqual)
+{
+	int idx;
+	for (idx = 0; idx < memsize / sizeof(long long); idx++)
+	{
+		if (first[idx] != second[idx])
+		{
+
+			printf("Nisu jednaki memSize : %d idx %llu first %llu second %llu \n",
+				memsize, idx, first[idx], second[idx]);
+			*isEqual = 0;
+			return;
+		}
+	}
+}
+
+const int MASTER_RANK = 0;
+#define NUM_PROCESSES 4
+#define NUM_MASTER_SEND 5
+#define NUM_MASTER_RECIEVE 3
+
+int main(int argc, char **argv)
+{
+	struct pb_TimerSet timers;
+	struct pb_Parameters *params;
+	int rf, k, nbins, npd, npr;
+	float *binb, w;
+	long long *DD, **RRSSeq, **DRSSeq, **RRSPar, **DRSPar, *RRS, *DRS;
+	size_t memsize;
+	struct cartesian *data, *random;
+	FILE *outfile;
+
+	char *seqStr = "Sequential";
+	char *parStr = "Parallel";
+	char *mixedStr = "Mixed";
+
+	int idx;
+	int isEqual;
+	int dummyNull;
+	int dummyTrue = 1;
+	int dummyFalse = 0;
+	int rank;
+	int size;
+
+	int busy[NUM_PROCESSES] = { 0 };
+	MPI_Request requestSent[NUM_PROCESSES][NUM_MASTER_SEND];
+	MPI_Request requestRecieved[NUM_PROCESSES][NUM_MASTER_RECIEVE];
+	MPI_Status status;
+	char signal = 1;
+	int isWaitingForAnswer[NUM_PROCESSES] = { 0 };
+
+	MPI_Init(&argc, &argv);
+
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	MPI_Comm_size(MPI_COMM_WORLD, &size);
+	if (NUM_PROCESSES != size)
+	{
+		MPI_Abort(MPI_COMM_WORLD, -1);
+	}
+
+	pb_InitializeTimerSet(&timers);
+	pb_AddSubTimer(&timers, seqStr, pb_TimerID_COMPUTE);
+	pb_AddSubTimer(&timers, seqStr, pb_TimerID_IO);
+	pb_AddSubTimer(&timers, parStr, pb_TimerID_COMPUTE);
+	pb_AddSubTimer(&timers, parStr, pb_TimerID_IO);
+	pb_AddSubTimer(&timers, mixedStr, pb_TimerID_COMPUTE);
+	pb_AddSubTimer(&timers, mixedStr, pb_TimerID_IO);
+
+	params = pb_ReadParameters(&argc, argv);
+
+	options args;
+	parse_args(argc, argv, &args);
+
+	pb_SwitchToSubTimer(&timers, mixedStr, pb_TimerID_COMPUTE);
+	nbins = (int)floor(bins_per_dec * (log10(max_arcmin) -
+		log10(min_arcmin)));
+	memsize = (nbins + 2) * sizeof(long long);
+
+	// memory for bin boundaries
+	binb = (float *)malloc((nbins + 1) * sizeof(float));
+	if (binb == NULL)
+	{
+		fprintf(stderr, "Unable to allocate memory\n");
+		MPI_Abort(MPI_COMM_WORLD, -1);;
+	}
+	for (k = 0; k < nbins + 1; k++)
+	{
+		binb[k] = cos(pow(10, log10(min_arcmin) +
+			k*1.0 / bins_per_dec) / 60.0*D2R);
+	}
+
+	// memory for DD
+	DD = (long long*)malloc(memsize);
+	if (DD == NULL)
+	{
+		fprintf(stderr, "Unable to allocate memory\n");
+		MPI_Abort(MPI_COMM_WORLD, -1);;
+	}
+	bzero(DD, memsize);
+
+	if (MASTER_RANK == rank)
+	{
+		// memory for RRSSeq
+		pb_SwitchToSubTimer(&timers, seqStr, pb_TimerID_COMPUTE);
+		RRSSeq = (long long**)malloc(args.random_count * sizeof(long long*));
+		for (idx = 0; idx < args.random_count; idx++)
+		{
+			RRSSeq[idx] = (long long*)malloc(memsize);
+			if (RRSSeq[idx] == NULL)
+			{
+				fprintf(stderr, "Unable to allocate memory\n");
+				MPI_Abort(MPI_COMM_WORLD, -1);
+			}
+			bzero(RRSSeq[idx], memsize);
+		}
+
+		// memory for RRSPar
+		pb_SwitchToSubTimer(&timers, parStr, pb_TimerID_COMPUTE);
+		RRSPar = (long long**)malloc(args.random_count * sizeof(long long*));
+		for (idx = 0; idx < args.random_count; idx++)
+		{
+			RRSPar[idx] = (long long*)malloc(memsize);
+			if (RRSPar[idx] == NULL)
+			{
+				fprintf(stderr, "Unable to allocate memory\n");
+				MPI_Abort(MPI_COMM_WORLD, -1);
+			}
+			bzero(RRSPar[idx], memsize);
+		}
+
+		// memory for DRSSeq
+		pb_SwitchToSubTimer(&timers, seqStr, pb_TimerID_COMPUTE);
+		DRSSeq = (long long**)malloc(args.random_count * sizeof(long long*));
+		for (idx = 0; idx < args.random_count; idx++)
+		{
+			DRSSeq[idx] = (long long*)malloc(memsize);
+			if (DRSSeq[idx] == NULL)
+			{
+				fprintf(stderr, "Unable to allocate memory\n");
+				MPI_Abort(MPI_COMM_WORLD, -1);
+			}
+			bzero(DRSSeq[idx], memsize);
+		}
+
+		// memory for DRSSeq
+		pb_SwitchToSubTimer(&timers, parStr, pb_TimerID_COMPUTE);
+		DRSPar = (long long**)malloc(args.random_count * sizeof(long long*));
+		for (idx = 0; idx < args.random_count; idx++)
+		{
+			DRSPar[idx] = (long long*)malloc(memsize);
+			if (DRSPar[idx] == NULL)
+			{
+				fprintf(stderr, "Unable to allocate memory\n");
+				MPI_Abort(MPI_COMM_WORLD, -1);
+			}
+			bzero(DRSPar[idx], memsize);
+		}
+	}
+	else
+	{
+		RRS = (long long*)malloc(memsize);
+		if (RRS == NULL)
+		{
+			fprintf(stderr, "Unable to allocate memory\n");
+			MPI_Abort(MPI_COMM_WORLD, -1);
+		}
+		bzero(RRS, memsize);
+
+		DRS = (long long*)malloc(memsize);
+		if (DRS == NULL)
+		{
+			fprintf(stderr, "Unable to allocate memory\n");
+			MPI_Abort(MPI_COMM_WORLD, -1);
+		}
+		bzero(DRS, memsize);
+	}
+	pb_SwitchToSubTimer(&timers, mixedStr, pb_TimerID_COMPUTE);
+	// memory for input data
+	data = (struct cartesian*)malloc
+	(args.npoints * sizeof(struct cartesian));
+	if (data == NULL)
+	{
+		fprintf(stderr,
+			"Unable to allocate memory for % data points (#1)\n",
+			args.npoints);
+		return(0);
+	}
+
+	random = (struct cartesian*)malloc
+	(args.npoints * sizeof(struct cartesian));
+	if (random == NULL)
+	{
+		fprintf(stderr,
+			"Unable to allocate memory for % data points (#2)\n",
+			args.npoints);
+		return(0);
+	}
+
+	pb_SwitchToSubTimer(&timers, parStr, pb_TimerID_COMPUTE);
+
+
+	if (MASTER_RANK == rank)
+	{
+		printf("Min distance: %f arcmin\n", min_arcmin);
+		printf("Max distance: %f arcmin\n", max_arcmin);
+		printf("Bins per dec: %i\n", bins_per_dec);
+		printf("Total bins  : %i\n", nbins);
+		printf("Tu puca\n");
+		// read data file
+		pb_SwitchToSubTimer(&timers, mixedStr, pb_TimerID_IO);
+		
+		npd = readdatafile(params->inpFiles[0], data, args.npoints);
+		printf("Tu posle\n");
+		pb_SwitchToSubTimer(&timers, mixedStr, pb_TimerID_COMPUTE);
+		if (npd != args.npoints)
+		{
+			fprintf(stderr,
+				"Error: read %i data points out of %i\n",
+				npd, args.npoints);
+			return(0);
+		}
+
+		printf("PRoslo citanje\n");
+
+		// compute DD
+		doCompute(data, npd, NULL, 0, 1, DD, nbins, binb);
+		pb_SwitchToSubTimer(&timers, seqStr, pb_TimerID_COMPUTE);
+		
+		printf("PRoslo racunanje\n");
+		// *********** SEQUENTIAL PART *******************\\
+				// loop through random data files
+		for (rf = 0; rf < args.random_count; rf++)
+		{
+			// read random file
+			pb_SwitchToSubTimer(&timers, mixedStr, pb_TimerID_IO);
+			npr = readdatafile(params->inpFiles[rf + 1], random, args.npoints);
+			pb_SwitchToSubTimer(&timers, seqStr, pb_TimerID_COMPUTE);
+			if (npr != args.npoints)
+			{
+				fprintf(stderr,
+					"Error: read %i random points out of %i in file %s\n",
+					npr, args.npoints, params->inpFiles[rf + 1]);
+				return(0);
+			}
+
+			// compute RR
+			doCompute(random, npr, NULL, 0, 1, RRSSeq[rf], nbins, binb);
+
+			// compute DR
+			doCompute(data, npd, random, npr, 0, DRSSeq[rf], nbins, binb);
+		}
+
+
+
+		pb_SwitchToSubTimer(&timers, parStr, pb_TimerID_COMPUTE);
+
+		MPI_Bcast(&data, sizeof(struct cartesian) * args.npoints, MPI_BYTE,
+			MASTER_RANK, MPI_COMM_WORLD);
+		MPI_Bcast(&data, 1, MPI_INT, MASTER_RANK, MPI_COMM_WORLD);
+		// *********** PARALLEL PART *******************\\
+				// loop through random data files
+		for (rf = 0; rf < args.random_count; rf++)
+		{
+			// read random file
+			pb_SwitchToSubTimer(&timers, parStr, pb_TimerID_IO);
+			npr = readdatafile(params->inpFiles[rf + 1], random, args.npoints);
+			pb_SwitchToSubTimer(&timers, parStr, pb_TimerID_COMPUTE);
+			if (npr != args.npoints)
+			{
+				fprintf(stderr,
+					"Error: read %i random points out of %i in file %s\n",
+					npr, args.npoints, params->inpFiles[rf + 1]);
+				return(0);
+			}
+
+			while (1)
+			{
+				int found = 0;
+				for (idx = 1; idx < NUM_PROCESSES; idx++)
+				{
+					if (!busy[idx])
+					{
+						found = 1;
+						// signal
+						MPI_Send(&signal, 1, MPI_BYTE, idx, TAG_SIGNAL,
+							MPI_COMM_WORLD);
+						// random
+						MPI_Send(&random, sizeof(struct cartesian) * args.npoints,
+							MPI_BYTE, idx, TAG_RANDOM, MPI_COMM_WORLD);
+						// npr
+						MPI_Send(&npr, 1,
+							MPI_INT, idx, TAG_NPR, MPI_COMM_WORLD);
+
+						busy[idx] = 1;
+						MPI_Irecv(RRSPar[rf], nbins + 1, MPI_LONG_LONG, idx, TAG_RRS,
+							MPI_COMM_WORLD, &requestRecieved[idx][1]);
+						MPI_Irecv(DRSPar[rf], nbins + 1, MPI_LONG_LONG, idx, TAG_DRS,
+							MPI_COMM_WORLD, &requestRecieved[idx][2]);
+						MPI_Irecv(&busy[idx], 1, MPI_INT, idx, TAG_JOB_FINISHED,
+							MPI_COMM_WORLD, &requestRecieved[idx][0]);
+					}
+
+				}
+				if (found)
+				{
+					break;
+				}
+			}
+
+		}
+
+		signal = 0;
+		for (idx = 1; idx < NUM_PROCESSES; idx++)
+		{
+			while (busy[idx]);
+			MPI_Send(&signal, 1, MPI_BYTE, idx, TAG_SIGNAL, MPI_COMM_WORLD);
+		}
+
+		// two different outputs needed
+		// compute and output results
+		if ((outfile = fopen(params->outFile, "w")) == NULL)
+		{
+			fprintf(stderr,
+				"Unable to open output file %s for writing, assuming stdout\n",
+				params->outFile);
+			outfile = stdout;
+		}
+		pb_SwitchToSubTimer(&timers, seqStr, pb_TimerID_IO);
+		for (k = 1; k < nbins + 1; k++)
+		{
+			fprintf(outfile, "%d\n%d\n%d\n", DD[k],
+				DRSSeq[args.random_count - 1][k],
+				RRSSeq[args.random_count - 1][k]);
+		}
+
+		pb_SwitchToSubTimer(&timers, parStr, pb_TimerID_IO);
+		for (k = 1; k < nbins + 1; k++)
+		{
+			fprintf(outfile, "%d\n%d\n%d\n", DD[k],
+				DRSPar[args.random_count - 1][k],
+				RRSPar[args.random_count - 1][k]);
+		}
+
+		pb_SwitchToSubTimer(&timers, mixedStr, pb_TimerID_IO);
+
+		if (outfile != stdout)
+			fclose(outfile);
+
+		pb_SwitchToSubTimer(&timers, mixedStr, pb_TimerID_COMPUTE);
+		for (idx = 0; idx < args.random_count; idx++)
+		{
+			CompareAndSet(DRSPar[idx], DRSSeq[idx], nbins + 1, &isEqual);
+		}
+	}
+	else {
+		MPI_Bcast(&data, sizeof(struct cartesian) * args.npoints, MPI_BYTE,
+			MASTER_RANK, MPI_COMM_WORLD);
+		MPI_Bcast(&data, 1, MPI_INT, MASTER_RANK, MPI_COMM_WORLD);
+		while (1) {
+
+			MPI_Recv(&signal, 1, MPI_BYTE, MASTER_RANK, TAG_SIGNAL, MPI_COMM_WORLD, &status);
+
+			if (signal)
+			{
+				MPI_Recv(&random, sizeof(struct cartesian) * args.npoints,
+					MPI_BYTE, MASTER_RANK, TAG_RANDOM, MPI_COMM_WORLD, &status);
+
+				MPI_Recv(&npr, 1, MPI_INT, MASTER_RANK, TAG_NPR, MPI_COMM_WORLD, &status);
+
+				// compute RR
+				doCompute(random, npr, NULL, 0, 1, RRS, nbins, binb);
+
+				// compute DR
+				doCompute(data, npd, random, npr, 0, DRS, nbins, binb);
+
+				MPI_Send(RRS, nbins + 1, MPI_LONG_LONG, MASTER_RANK, TAG_RRS, MPI_COMM_WORLD);
+				MPI_Send(DRS, nbins + 1, MPI_LONG_LONG, MASTER_RANK, TAG_DRS, MPI_COMM_WORLD);
+				MPI_Send(&dummyFalse, 1, MPI_INT, MASTER_RANK, TAG_JOB_FINISHED, MPI_COMM_WORLD);
+			}
+			else
+			{
+				break;
+			}
+		}
+	}
+	// free memory
+	free(data);
+	free(random);
+	free(binb);
+	free(DD);
+
+	if (MASTER_RANK == rank)
+	{
+		pb_SwitchToSubTimer(&timers, seqStr, pb_TimerID_COMPUTE);
+		for (idx = 0; idx < args.random_count; idx++)
+		{
+			free(RRSSeq[idx]);
+		}
+		free(RRSSeq);
+
+		pb_SwitchToSubTimer(&timers, parStr, pb_TimerID_COMPUTE);
+		for (idx = 0; idx < args.random_count; idx++)
+		{
+			free(RRSPar[idx]);
+		}
+		free(RRSPar);
+
+		pb_SwitchToSubTimer(&timers, seqStr, pb_TimerID_COMPUTE);
+		for (idx = 0; idx < args.random_count; idx++)
+		{
+			free(DRSSeq[idx]);
+		}
+		free(DRSSeq);
+
+		pb_SwitchToSubTimer(&timers, parStr, pb_TimerID_COMPUTE);
+		for (idx = 0; idx < args.random_count; idx++)
+		{
+			free(DRSPar[idx]);
+		}
+		free(DRSPar);
+
+		pb_SwitchToTimer(&timers, pb_TimerID_NONE);
+
+		if (isEqual)
+		{
+			printf(" Test PASSED\n");
+		}
+		else
+		{
+			printf(" Test FAILED\n");
+		}
+		pb_PrintTimerSet(&timers);
+	}
+
+	pb_FreeParameters(params);
+	MPI_Finalize();
+}
+
